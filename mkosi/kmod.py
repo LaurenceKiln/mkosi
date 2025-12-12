@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Iterable, Iterator, Reversible
+from collections.abc import Generator, Iterable, Iterator, Reversible
 from pathlib import Path
 
 from mkosi.context import Context
@@ -18,9 +18,28 @@ from mkosi.util import chdir, flatten, parents_below
 
 
 @dataclasses.dataclass(frozen=True)
-class DepsInfo:
-    moddep: dict[str, set[str]]
-    firmwaredep: dict[str, set[Path]]
+class Dependencies:
+    hard: dict[str, set[str]]
+    soft: dict[str, set[str]]
+    fw: dict[str, set[Path]]
+
+    def update(self, deps_info: "Dependencies") -> None:
+        self.hard.update(deps_info.hard)
+        self.soft.update(deps_info.soft)
+        self.fw.update(deps_info.fw)
+
+    def all_mods(self) -> set[str]:
+        return self.hard.keys() | self.soft.keys()
+
+    def all_moddeps(self) -> set[str]:
+        return set(flatten(self.hard.values())) | set(flatten(self.soft.values()))
+
+    def all_moddeps_typed(self) -> Generator[tuple[str, str, str]]:
+        for label, collection in [("soft", self.soft), ("hard", self.hard)]:
+            yield from ((m, label, dep) for m, deps in collection.items() for dep in deps)
+
+    def all_fwdeps(self) -> set[Path]:
+        return set(flatten(self.fw.values()))
 
 
 def loaded_modules() -> list[str]:
@@ -230,20 +249,14 @@ def modinfo(context: Context, kver: str, modules: Iterable[str]) -> str:
 def parse_modinfo_output(
     context: Context,
     info: str,
-) -> DepsInfo:
-    """Parses modinfo output into structured dependency data
-
-    Returns a tuple of dependency information (moddep, firmwaredep), where:
-    - moddep: dict[str, set[str]], maps normalized module names to thee normalized
-      names of their dependencies. Include `modules` as well as the transitive
-      closure of their dependencies.
-    - firmwaredep: dict[str, set[Path]], maps normalized names of firmware blobs
-      discovered as module dependencies, to their files path.
-    """
-    result = DepsInfo(moddep={}, firmwaredep={})
+) -> Dependencies:
+    """Parse modinfo output into structured dependency data"""
+    result = Dependencies(hard={}, soft={}, fw={})
 
     depends: set[str] = set()
+    soft_depends: set[str] = set()
     firmware: set[Path] = set()
+    missing_firmware: set[str] = set()
 
     with chdir(context.root):
         for line in info.split("\0"):
@@ -259,7 +272,7 @@ def parse_modinfo_output(
             elif key == "softdep":
                 # softdep is delimited by spaces and can contain strings like pre: and post: so discard
                 # anything that ends with a colon.
-                depends.update(normalize_module_name(d) for d in value.split() if not d.endswith(":"))
+                soft_depends.update(normalize_module_name(d) for d in value.split() if not d.endswith(":"))
 
             elif key == "firmware":
                 if (Path("usr/lib/firmware") / value).exists():
@@ -272,11 +285,17 @@ def parse_modinfo_output(
             elif key == "name":
                 name = normalize_module_name(value)
 
-                result.moddep[name] = depends
-                result.firmwaredep[name] = firmware
+                for fw in missing_firmware:
+                    logging.warning(f"{fw} is a fw dependency of {name} but is not installed, ignoring")
+
+                result.hard[name] = depends
+                result.soft[name] = soft_depends
+                result.fw[name] = firmware
 
                 depends = set()
+                soft_depends = set()
                 firmware = set()
+                missing_firmware = set()
 
     return result
 
@@ -302,35 +321,26 @@ def resolve_module_dependencies(
 
     log_step("Resolving dependencies for kernel modules and detecting needed firmware")
 
-    moddep: dict[str, set[str]] = {}
-    firmwaredep: dict[str, set[Path]] = {}
-
     modules = {normalize_module_name(m) for m in modules}  # ensure normalized names
     available = builtin | nametofile.keys()
-    todo = modules & available
-    done = set()
 
-    for m in set(modules) - available:
-        # FIXME: should abort?
+    for m in modules - available:
+        # FIXME: should abort here? and also on missing hard-deps below?
         logging.warning(f"{m} was requested but is not installed, ignoring.")
 
+    todo = modules & available
+    deps = Dependencies(hard={m: set() for m in todo}, soft={}, fw={})
+
     while todo:
-        info = modinfo(context, kver, todo)
+        deps.update(parse_modinfo_output(context, modinfo(context, kver, todo)))
+        todo = (deps.all_moddeps() - deps.all_mods()) & available
 
-        result = parse_modinfo_output(context, info)
-        moddep.update(result.moddep)
-        firmwaredep.update(result.firmwaredep)
+    mods = (deps.all_mods() - builtin) & available
+    firmware = deps.all_fwdeps()
 
-        done.update(todo)
-        todo = (set(flatten(moddep.values())) - done) & available
-
-    mods = (moddep.keys() - builtin) & available
-    firmware = {fw for fws in firmwaredep.values() for fw in fws}
-
-    for m, depends in moddep.items():
-        for d in depends:
-            if d not in available:
-                logging.warning(f"{d} is a dependency of {m} but is not installed, ignoring.")
+    for m, typ, dep in deps.all_moddeps_typed():
+        if dep not in available:
+            logging.warning(f"{dep} is a {typ} dependency of {m} but is not installed, ignoring.")
 
     logging.debug(f"The following {len(mods)} kernel modules will be included in the image:")
     logging.debug(sorted(mods))
