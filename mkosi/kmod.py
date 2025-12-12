@@ -14,7 +14,7 @@ from mkosi.context import Context
 from mkosi.log import complete_step, log_step
 from mkosi.run import chroot_cmd, run
 from mkosi.sandbox import chase
-from mkosi.util import chdir, parents_below
+from mkosi.util import chdir, flatten, parents_below
 
 
 @dataclasses.dataclass(frozen=True)
@@ -210,7 +210,7 @@ def module_path_to_name(path: Path) -> str:
 
 
 def modinfo(context: Context, kver: str, modules: Iterable[str]) -> str:
-    cmdline = ["modinfo", "--set-version", kver, "--null"]
+    cmdline = ["modinfo", "--modname", "--set-version", kver, "--null"]
 
     if context.config.output_format.is_extension_image() and not context.config.overlay:
         cmdline += ["--basedir", "/buildroot"]
@@ -293,53 +293,51 @@ def resolve_module_dependencies(
     """
     modulesd = Path("usr/lib/modules") / kver
     if (p := context.root / modulesd / "modules.builtin").exists():
-        builtin = set(module_path_to_name(Path(m)) for m in p.read_text().splitlines())
+        builtin = {module_path_to_name(Path(m)) for m in p.read_text().splitlines()}
     else:
         builtin = set()
     with chdir(context.root):
         allmodules = set(modulesd.rglob("*.ko*"))
     nametofile = {module_path_to_name(m): m for m in allmodules}
 
-    log_step("Running modinfo to fetch kernel module dependencies")
+    log_step("Resolving dependencies for kernel modules and detecting needed firmware")
 
-    # We could run modinfo once for each module but that's slow. Luckily we can pass multiple modules to
-    # modinfo and it'll process them all in a single go. We get the modinfo for all modules to build two maps
-    # that map the path of the module to its module dependencies and its firmware dependencies
-    # respectively. Because there's more kernel modules than the max number of accepted CLI arguments, we
-    # split the modules list up into chunks.
-    info = ""
-    for i in range(0, len(nametofile.keys()), 8500):
-        chunk = list(nametofile.keys())[i : i + 8500]
-        info += modinfo(context, kver, chunk)
+    moddep: dict[str, set[str]] = {}
+    firmwaredep: dict[str, set[Path]] = {}
 
-    log_step("Calculating required kernel modules and firmware")
+    modules = {normalize_module_name(m) for m in modules}  # ensure normalized names
+    available = builtin | nametofile.keys()
+    todo = modules & available
+    done = set()
 
-    moddep = {}
-    firmwaredep = {}
-
-    result = parse_modinfo_output(context, info)
-    moddep.update(result.moddep)
-    firmwaredep.update(result.firmwaredep)
-
-    todo = [*builtin, *modules]
-    mods = set()
-    firmware = set()
+    for m in set(modules) - available:
+        # FIXME: should abort?
+        logging.warning(f"{m} was requested but is not installed, ignoring.")
 
     while todo:
-        m = todo.pop()
-        if m in mods:
-            continue
+        info = modinfo(context, kver, todo)
 
-        depends = moddep.get(m, set())
+        result = parse_modinfo_output(context, info)
+        moddep.update(result.moddep)
+        firmwaredep.update(result.firmwaredep)
+
+        done.update(todo)
+        todo = (set(flatten(moddep.values())) - done) & available
+
+    mods = (moddep.keys() - builtin) & available
+    firmware = {fw for fws in firmwaredep.values() for fw in fws}
+
+    for m, depends in moddep.items():
         for d in depends:
-            if d not in nametofile and d not in builtin:
-                logging.warning(f"{d} is a dependency of {m} but is not installed, ignoring ")
+            if d not in available:
+                logging.warning(f"{d} is a dependency of {m} but is not installed, ignoring.")
 
-        mods.add(m)
-        todo += depends
-        firmware.update(firmwaredep.get(m, set()))
+    logging.debug(f"The following {len(mods)} kernel modules will be included in the image:")
+    logging.debug(sorted(mods))
+    logging.debug(f"The following {len(firmware)} firmware files were detected as kmod dependencies:")
+    logging.debug(sorted(firmware))
 
-    return set(nametofile[m] for m in mods if m in nametofile), set(firmware)
+    return {nametofile[m] for m in mods if m in nametofile}, firmware
 
 
 def gen_required_kernel_modules(
